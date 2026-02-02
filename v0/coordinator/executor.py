@@ -37,6 +37,86 @@ class ProjectLibrarianExecutor(AgentExecutor):
             pass
         return ""
 
+    def _extract_user_id(self, context: RequestContext, query: str) -> str:
+        """Ultra Robust user_id extraction from multiple possible locations."""
+        user_id = ""
+        
+        def extract_from_dict(d):
+            if not isinstance(d, dict): return None
+            return d.get("email_of_the_conversation_partner") or d.get("email") or d.get("user_id") or d.get("user")
+
+        # 1. Standard Protocol/Metadata
+        if getattr(context.message, "user_id", None):
+            user_id = context.message.user_id
+            
+        if not user_id and hasattr(context.message, "metadata") and context.message.metadata:
+            meta = context.message.metadata
+            user_id = extract_from_dict(meta) if isinstance(meta, dict) else (getattr(meta, "user_id", None) or getattr(meta, "email", None))
+
+        # 2. Deep Scanning of Parts
+        if not user_id and hasattr(context.message, "parts"):
+            import json
+            for i, part in enumerate(context.message.parts):
+                texts = []
+                texts.append(getattr(part, "text", ""))
+                if hasattr(part, "root"):
+                    texts.append(getattr(part.root, "text", ""))
+                    if isinstance(part.root, dict): texts.append(part.root.get("text", ""))
+                
+                for text in texts:
+                    if not text or not isinstance(text, str): continue
+                    if "{" in text:
+                        try:
+                            import re
+                            for match in re.findall(r'\{.*?\}', text, re.DOTALL):
+                                data = json.loads(match)
+                                uid = extract_from_dict(data)
+                                if uid:
+                                    user_id = uid
+                                    print(f"[ProjectLibrarian] Found user_id in part[{i}] JSON: {user_id}")
+                                    break
+                        except: pass
+                    if user_id: break
+                if user_id: break
+
+        # 3. Regex scan of EVERYTHING
+        if not user_id or user_id == "default_user":
+            import re
+            import json
+            combined_search = query + " " + repr(context.message)
+            
+            # A. Try JSON-like structures
+            for match in re.findall(r'\{.*?\}', combined_search, re.DOTALL):
+                try:
+                    j_str = match.replace("'", '"').replace("None", "null").replace("True", "true").replace("False", "false")
+                    data = json.loads(j_str)
+                    uid = extract_from_dict(data)
+                    if uid:
+                        user_id = uid
+                        print(f"[ProjectLibrarian] Found user_id in combined regex (JSON): {user_id}")
+                        break
+                except: pass
+            
+            # B. Try plain text labels
+            if not user_id or user_id == "default_user":
+                patterns = [
+                    r"email_of_the_conversation_partner[:\s]+([^\s,{}]+)",
+                    r"user_id[:\s]+([^\s,{}]+)",
+                    r"email[:\s]+([^\s,{}]+)"
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, combined_search)
+                    if match:
+                        user_id = match.group(1).strip('"\'')
+                        print(f"[ProjectLibrarian] Found user_id in combined regex (Label): {user_id}")
+                        break
+
+        # 4. Fallback (Context ID)
+        if not user_id:
+            user_id = self._extract_user_id_from_context_id(context.context_id)
+        
+        return user_id or "default_user"
+
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # このエージェントではキャンセル処理は未実装としています
         raise NotImplementedError("Task cancellation is not supported")
@@ -72,90 +152,12 @@ class ProjectLibrarianExecutor(AgentExecutor):
         query = context.get_user_input()
         content = types.Content(role="user", parts=[types.Part(text=query)])
         
-        # --- Ultra Robust user_id Extraction ---
-        user_id = ""
         print(f"[ProjectLibrarian][DEBUG] context_id: {context.context_id}")
         print(f"[ProjectLibrarian][DEBUG] query: {query}")
         print(f"[ProjectLibrarian][DEBUG] message object: {repr(context.message)}")
-        
-        def extract_from_dict(d):
-            if not isinstance(d, dict): return None
-            return d.get("email_of_the_conversation_partner") or d.get("email") or d.get("user_id") or d.get("user")
 
-        # 1. Standard Protocol/Metadata (Checked first)
-        if getattr(context.message, "user_id", None):
-            user_id = context.message.user_id
-        if not user_id and hasattr(context.message, "metadata") and context.message.metadata:
-            meta = context.message.metadata
-            user_id = extract_from_dict(meta) if isinstance(meta, dict) else (getattr(meta, "user_id", None) or getattr(meta, "email", None))
-
-        # 2. Deep Scanning of Parts (Handling Part(root=TextPart(...)))
-        if not user_id and hasattr(context.message, "parts"):
-            import json
-            for i, part in enumerate(context.message.parts):
-                # Try all possible text locations
-                texts = []
-                texts.append(getattr(part, "text", ""))
-                if hasattr(part, "root"):
-                    texts.append(getattr(part.root, "text", ""))
-                    if isinstance(part.root, dict): texts.append(part.root.get("text", ""))
-                
-                for text in texts:
-                    if not text or not isinstance(text, str): continue
-                    if "{" in text:
-                        try:
-                            import re
-                            # Extract all JSON-like chunks
-                            for match in re.findall(r'\{.*?\}', text, re.DOTALL):
-                                data = json.loads(match)
-                                uid = extract_from_dict(data)
-                                if uid:
-                                    user_id = uid
-                                    print(f"[ProjectLibrarian] Found user_id in part[{i}] JSON: {user_id}")
-                                    break
-                        except: pass
-                    if user_id: break
-                if user_id: break
-
-        # 3. Last Resort: Regex scan of EVERYTHING (joined query + full message repr)
-        if not user_id or user_id == "default_user":
-            import re
-            import json
-            combined_search = query + " " + repr(context.message)
-            
-            # A. Try JSON-like structures
-            for match in re.findall(r'\{.*?\}', combined_search, re.DOTALL):
-                try:
-                    j_str = match.replace("'", '"').replace("None", "null").replace("True", "true").replace("False", "false")
-                    data = json.loads(j_str)
-                    uid = extract_from_dict(data)
-                    if uid:
-                        user_id = uid
-                        print(f"[ProjectLibrarian] Found user_id in combined regex (JSON): {user_id}")
-                        break
-                except: pass
-            
-            # B. Try plain text labels (email_of_the_conversation_partner: ...)
-            if not user_id or user_id == "default_user":
-                patterns = [
-                    r"email_of_the_conversation_partner[:\s]+([^\s,{}]+)",
-                    r"user_id[:\s]+([^\s,{}]+)",
-                    r"email[:\s]+([^\s,{}]+)"
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, combined_search)
-                    if match:
-                        user_id = match.group(1).strip('"\'')
-                        print(f"[ProjectLibrarian] Found user_id in combined regex (Label): {user_id}")
-                        break
-
-        # 4. Final Fallback (Context ID)
-        if not user_id:
-            user_id = self._extract_user_id_from_context_id(context.context_id)
-        
-        user_id = user_id or "default_user"
+        user_id = self._extract_user_id(context, query)
         print(f"[ProjectLibrarian] Final selected user_id: {user_id}")
-        # --- End Ultra Robust Extraction ---
 
         try:
             # context_id を本物の Vertex AI session_id に紐付ける（Vertex AIはカスタムID指定をサポートしていないため）
