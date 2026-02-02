@@ -38,83 +38,67 @@ class ProjectLibrarianExecutor(AgentExecutor):
         return ""
 
     def _extract_user_id(self, context: RequestContext, query: str) -> str:
-        """Ultra Robust user_id extraction from multiple possible locations."""
+        """Extract user_id from various possible locations in the request."""
         user_id = ""
         
-        def extract_from_dict(d):
+        def pick_uid(d):
             if not isinstance(d, dict): return None
-            return d.get("email_of_the_conversation_partner") or d.get("email") or d.get("user_id") or d.get("user")
+            # Robustness: Check all likely identity keys
+            return (d.get("user_id") or d.get("user") or 
+                    d.get("email_of_the_conversation_partner") or d.get("email"))
 
-        # 1. Standard Protocol/Metadata
-        if getattr(context.message, "user_id", None):
-            user_id = context.message.user_id
-            
-        if not user_id and hasattr(context.message, "metadata") and context.message.metadata:
-            meta = context.message.metadata
-            user_id = extract_from_dict(meta) if isinstance(meta, dict) else (getattr(meta, "user_id", None) or getattr(meta, "email", None))
+        # 1. Standard Protocol & Metadata
+        user_id = getattr(context.message, "user_id", "")
+        if not user_id and hasattr(context.message, "metadata"):
+            user_id = pick_uid(context.message.metadata) or getattr(context.message.metadata, "user_id", "")
 
-        # 2. Deep Scanning of Parts
+        # 2. Scanning Message Parts (JSON & Text)
         if not user_id and hasattr(context.message, "parts"):
-            import json
+            import json, re
             for i, part in enumerate(context.message.parts):
-                texts = []
-                texts.append(getattr(part, "text", ""))
-                if hasattr(part, "root"):
-                    texts.append(getattr(part.root, "text", ""))
-                    if isinstance(part.root, dict): texts.append(part.root.get("text", ""))
-                
-                for text in texts:
-                    if not text or not isinstance(text, str): continue
-                    if "{" in text:
-                        try:
-                            import re
-                            for match in re.findall(r'\{.*?\}', text, re.DOTALL):
-                                data = json.loads(match)
-                                uid = extract_from_dict(data)
-                                if uid:
-                                    user_id = uid
-                                    print(f"[ProjectLibrarian] Found user_id in part[{i}] JSON: {user_id}")
-                                    break
-                        except: pass
-                    if user_id: break
+                text = getattr(part, "text", "") or (getattr(part.root, "text", "") if hasattr(part, "root") else "")
+                if not text: continue
+
+                # Try JSON extraction
+                for match in re.findall(r'\{.*?\}', text, re.DOTALL):
+                    try:
+                        uid = pick_uid(json.loads(match))
+                        if uid:
+                            user_id = uid
+                            print(f"[ProjectLibrarian] Found user_id in part[{i}] JSON: {user_id}")
+                            break
+                    except: pass
                 if user_id: break
 
-        # 3. Regex scan of EVERYTHING
+        # 3. Global Regex Scan (JSON & Plain Text Labels)
         if not user_id or user_id == "default_user":
-            import re
-            import json
-            combined_search = query + " " + repr(context.message)
+            import re, json
+            raw_data = query + " " + repr(context.message)
             
-            # A. Try JSON-like structures
-            for match in re.findall(r'\{.*?\}', combined_search, re.DOTALL):
+            # A. Search for JSON in raw string
+            for match in re.findall(r'\{.*?\}', raw_data, re.DOTALL):
                 try:
                     j_str = match.replace("'", '"').replace("None", "null").replace("True", "true").replace("False", "false")
-                    data = json.loads(j_str)
-                    uid = extract_from_dict(data)
+                    uid = pick_uid(json.loads(j_str))
                     if uid:
                         user_id = uid
-                        print(f"[ProjectLibrarian] Found user_id in combined regex (JSON): {user_id}")
+                        print(f"[ProjectLibrarian] Found user_id in global JSON scan: {user_id}")
                         break
                 except: pass
             
-            # B. Try plain text labels
+            # B. Search for plain text labels (Avoiding internal strings like 'role=')
             if not user_id or user_id == "default_user":
-                patterns = [
-                    r"email_of_the_conversation_partner[:\s]+([^\s,{}]+)",
-                    r"user_id[:\s]+([^\s,{}]+)",
-                    r"email[:\s]+([^\s,{}]+)"
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, combined_search)
-                    if match:
-                        user_id = match.group(1).strip('"\'')
-                        print(f"[ProjectLibrarian] Found user_id in combined regex (Label): {user_id}")
-                        break
+                # Sharpen regex: look for user/user_id/email patterns specifically, avoiding common internal strings
+                match = re.search(r"(?:user_id|email_of_the_conversation_partner|email)[:\s]+[\"']?([^\s,\"'{}-]+@[^\s,\"'{}-]+\.[^\s,\"'{}-]+|[^\s,\"'{}-]+)", raw_data)
+                if match:
+                    val = match.group(1).strip('"\'')
+                    # internal strings often end with '>' or start with 'role='
+                    if not val.endswith('>') and 'role=' not in val:
+                        user_id = val
+                        print(f"[ProjectLibrarian] Found user_id via text label: {user_id}")
 
-        # 4. Fallback (Context ID)
-        if not user_id:
-            user_id = self._extract_user_id_from_context_id(context.context_id)
-        
+        # 4. Final Fallbacks
+        user_id = user_id or self._extract_user_id_from_context_id(context.context_id)
         return user_id or "default_user"
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
