@@ -977,10 +977,9 @@ def firestore_get_all_projects() -> str:
     try:
         db = _db_client
 
-        # Get all projects with status="open"
+        # Get all projects
         projects_ref = (
             db.collection("projects")
-            .where("status", "==", "open")
             .select(["projectName", "status", "members", "projectOverview"])
         )
 
@@ -996,10 +995,13 @@ def firestore_get_all_projects() -> str:
             if "members" in project_data:
                 for member in project_data["members"]:
                     # userRefが有効な場合のみユーザー情報を追加
-                    if "userRef" in member and hasattr(member["userRef"], "parent"):
-                        # userRefのパスからemailを取得: users/{email}/userProfiles/{id}
-                        user_email = member["userRef"].parent.parent.id
-                        member["userInfo"] = _get_user_info(user_email)
+                    if "userRef" in member and hasattr(member["userRef"], "path"):
+                        # userRefのパスからemailを取得
+                        # 対応形式: users/{email} または users/{email}/userProfiles/{id}
+                        path_parts = member["userRef"].path.split("/")
+                        if len(path_parts) >= 2 and path_parts[0] == "users":
+                            user_email = path_parts[1]
+                            member["userInfo"] = _get_user_info(user_email)
                     # isOwnerは常に削除
                     member.pop("isOwner", None)
                     member.pop("userRef", None)
@@ -1025,282 +1027,36 @@ def firestore_get_all_projects() -> str:
         return "No projects found"
 
 
-#############################################################################################
-# Advice Queue Tools (Write Operations)
-#############################################################################################
-def firestore_create_advice_queue(
-    user_email: str,
-    project_id: Optional[str] = None,
-    task_id: Optional[str] = None,
-    advice_type: str = "",
-    priority: int = 1,
-    reason: str = "",
-    suggested_time: str = "",
-) -> str:
+def firestore_get_project_by_id(project_id: str) -> str:
     """
-    アドバイスキューをFirestoreに登録
-
-    このツールは、アドバイススケジューラーが判定したアドバイス情報を
-    FirestoreのadviceQueueコレクションに保存します。
-    登録されたアドバイスは後で実行エージェントによって処理されます。
-
-    Args:
-        user_email (str): 対象ユーザーのメールアドレス
-        project_id (Optional[str]): プロジェクトID（プロジェクト関連アドバイスの場合）
-        task_id (Optional[str]): タスクID（タスク関連アドバイスの場合）
-        advice_type (str): アドバイスタイプ (general/project/task/urgent/team_coordination)
-        priority (int): 優先度 1-5（5が最高）
-        reason (str): アドバイスが必要な理由（具体的に記載）
-        suggested_time (str): 推奨実行時刻（ISO format, 例: "2025-01-15T10:00:00+09:00"）
-                            **重要: 必ず9:00-18:00(JST)の範囲内で指定してください**
-
-    Returns:
-        str: 登録結果メッセージ
-
-    Example:
-        >>> firestore_create_advice_queue(
-        ...     user_email="user@example.com",
-        ...     project_id="proj123",
-        ...     task_id="task456",
-        ...     advice_type="urgent",
-        ...     priority=5,
-        ...     reason="設計レビューが遅延、3名をブロック中",
-        ...     suggested_time="2025-01-15T10:00:00+09:00"
-        ... )
-        '✅ Advice queued for user@example.com (Priority 5, ID: abc123)'
+    特定のプロジェクトをIDで取得する
     """
+    logger.info(f"### firestore_get_project_by_id start: {project_id} ###")
     try:
         db = _db_client
-
-        # suggested_timeをtimestampに変換
-        # ISO formatの文字列をdatetimeに変換（'Z'を'+00:00'に置換してUTC対応）
-        advice_time_with_tz = datetime.fromisoformat(
-            suggested_time.replace("Z", "+00:00")
-        )
-        logger.info(f"{advice_time_with_tz=}")
-
-        # # JSTに変換して9:00-18:00の範囲内かチェック
-        jst_time = advice_time_with_tz.astimezone(ZoneInfo("Asia/Tokyo"))
-        logger.info(f"{jst_time=}")
-
-        # 現在時刻を取得（過去時刻チェック用）
-        # datetime.utcnow()ではなくdatetime.now(ZoneInfo("Asia/Tokyo"))を使用してJSTのaware datetimeを取得
-        current_time = datetime.now(ZoneInfo("Asia/Tokyo"))
-
-        # 過去時刻の自動調整ロジック
-        # priorityに応じて未来の時刻に調整する分数を変える
-        if jst_time <= current_time:
-            # priorityによる調整幅の決定
-            # priority 5 (最高): 5分後
-            # priority 4: 10分後
-            # priority 3: 15分後
-            # priority 2: 20分後
-            # priority 1 (最低): 30分後
-            priority_to_delay = {
-                5: 10,
-                4: 15,
-                3: 20,
-                2: 25,
-                1: 30,
-            }
-            delay_minutes = priority_to_delay.get(priority, 15)  # デフォルトは15分
-
-            adjusted_jst_time = current_time + timedelta(minutes=delay_minutes)
-
-            logger.warning(
-                f"⚠️ Suggested time {suggested_time} is in the past. "
-                f"Auto-adjusting to {adjusted_jst_time.isoformat()} "
-                f"(current time: {current_time.isoformat()}, priority: {priority}, delay: {delay_minutes}min)"
-            )
-
-            jst_time = adjusted_jst_time
-
-        hour = jst_time.hour
-
-        if hour < 9 or hour >= 18:
-            error_msg = f"❌ Invalid time: {suggested_time} (JST: {jst_time.strftime('%H:%M')}). Must be between 9:00-18:00 JST."
-            logger.error(error_msg)
-            return error_msg
-
-        # advice_timeはJSTのaware datetimeのまま（Firestoreが自動的にUTCに変換して保存）
-        advice_time = jst_time
-
-        # Firestoreに保存するドキュメントデータ
-        # Firestoreはaware datetimeを自動的にUTCに変換して保存し、取得時にタイムゾーン付きで復元
-        doc_data = {
-            "user_email": user_email,
-            "project_id": project_id,
-            "task_id": task_id,
-            "advice_type": advice_type,
-            "priority": priority,
-            "reason": reason,
-            "advice_time": advice_time,  # aware datetime (JST) → Firestoreが UTC に変換
-            "status": "pending",  # pending/processing/completed/failed
-            "created_at": current_time,  # aware datetime (JST) → Firestoreが UTC に変換
-            "processed_at": None,
-            "result": None,
-        }
-
-        # adviceQueueコレクションに追加
-        doc_ref = db.collection("adviceQueue").add(doc_data)
-
-        # 成功メッセージ
-        doc_id = doc_ref[1].id
-        logger.info(
-            f"✅ Advice queued: {user_email} (Priority {priority}, ID: {doc_id})"
-        )
-
-        return f"✅ Advice queued for {user_email} (Priority {priority}, ID: {doc_id}, Time: {suggested_time})"
-
-    except ValueError as e:
-        # ISO format変換エラー
-        error_msg = f"❌ Invalid time format: {suggested_time}. Use ISO format (e.g., '2025-01-15T10:00:00Z'). Error: {e}"
-        logger.error(error_msg)
-        return error_msg
-
+        doc = db.collection("projects").document(project_id).get()
+        
+        if not doc.exists:
+            return f"Project with ID {project_id} not found"
+            
+        project_data = doc.to_dict()
+        project_data["projectId"] = doc.id
+        
+        # メンバー情報のクリーンアップ/拡張
+        if "members" in project_data:
+            for member in project_data["members"]:
+                if "userRef" in member and hasattr(member["userRef"], "path"):
+                    path_parts = member["userRef"].path.split("/")
+                    if len(path_parts) >= 2 and path_parts[0] == "users":
+                        user_email = path_parts[1]
+                        member["userInfo"] = _get_user_info(user_email)
+                member.pop("isOwner", None)
+                member.pop("userRef", None)
+                
+        return str(project_data)
     except Exception as e:
-        # その他のエラー
-        error_msg = f"❌ Error creating advice queue for {user_email}: {e}"
-        logger.error(error_msg)
-        return error_msg
-
-
-def firestore_get_pending_advice_queue(
-    user_email: Optional[str] = None, hours: int = 24
-) -> str:
-    """
-    保留中(pending)または処理中(processing)のアドバイスキューを取得
-
-    指定時間内の保留中・処理中のアドバイスを取得します。
-    ユーザーメールを指定すると、そのユーザーのみに絞り込みます。
-
-    Args:
-        user_email (Optional[str]): 対象ユーザーのメールアドレス（Noneの場合は全ユーザー）
-        hours (int): 取得対象の時間範囲（デフォルト24時間）
-
-    Returns:
-        str: アドバイスキューのJSON文字列
-
-    Example:
-        >>> firestore_get_pending_advice_queue(user_email="user@example.com")
-        '[{"id": "abc123", "user_email": "user@example.com", "advice_type": "urgent", ...}]'
-    """
-    try:
-        db = _db_client
-        # 現在時刻をUTC aware datetimeで取得してJSTに変換
-        current_time_jst = convert_utc_to_jst(datetime.now(dt_timezone.utc))
-        threshold_time = current_time_jst - timedelta(hours=hours)
-
-        logger.info(
-            f"🔍 firestore_get_pending_advice_queue called: "
-            f"user_email={user_email}, hours={hours}, "
-            f"threshold_time={threshold_time.isoformat()}"
-        )
-
-        # インデックスに合わせたクエリ順序: status → user_email → created_at
-        # インデックス: status (Ascending), user_email (Ascending), created_at (Ascending)
-        query = db.collection("adviceQueue").where(
-            "status", "in", ["pending", "processing"]
-        )
-
-        if user_email:
-            query = query.where("user_email", "==", user_email)
-
-        query = query.where("created_at", ">=", threshold_time)
-
-        docs = list(query.stream())
-
-        if not docs:
-            logger.info(
-                f"📋 No pending/processing advice found for {user_email or 'all users'}"
-            )
-            return "[]"
-
-        # ドキュメントをJSON形式に変換
-        import json
-
-        advice_list = []
-        for doc in docs:
-            advice_data = doc.to_dict()
-            advice_data["id"] = doc.id
-
-            # datetimeオブジェクトをISO文字列に変換
-            for key in ["advice_time", "created_at", "processed_at"]:
-                if key in advice_data and advice_data[key]:
-                    if isinstance(advice_data[key], datetime):
-                        advice_data[key] = advice_data[key].isoformat()
-
-            advice_list.append(advice_data)
-
-        logger.info(
-            f"📋 Found {len(advice_list)} pending/processing advice(s) for {user_email or 'all users'}"
-        )
-
-        # 各アドバイスの概要をログ出力
-        for idx, advice in enumerate(advice_list, 1):
-            logger.info(
-                f"  [{idx}] ID: {advice.get('id')}, "
-                f"Type: {advice.get('advice_type')}, "
-                f"Reason: {advice.get('reason', '')[:50]}..."
-            )
-
-        return json.dumps(advice_list, ensure_ascii=False, indent=2)
-
-    except Exception as e:
-        error_msg = f"❌ Error getting pending advice queue: {e}"
-        logger.error(error_msg)
-        return "[]"
-
-
-def firestore_update_advice_queue_status(
-    queue_id: str, status: str, result: Optional[str] = None
-) -> str:
-    """
-    adviceQueueのステータスを更新
-
-    このツールは、アドバイス実行後にadviceQueueコレクションのドキュメントを更新します。
-    処理結果を記録し、重複実行を防ぎます。
-
-    Args:
-        queue_id (str): adviceQueueのドキュメントID
-        status (str): 更新後のステータス (processing/completed/failed)
-        result (Optional[str]): 処理結果メッセージ（completed/failedの場合に設定）
-
-    Returns:
-        str: 更新結果メッセージ
-
-    Example:
-        >>> firestore_update_advice_queue_status(
-        ...     queue_id="abc123",
-        ...     status="completed",
-        ...     result="アドバイスを正常に配信しました"
-        ... )
-        '✅ Advice queue abc123 updated to completed'
-    """
-    logger.info("### firestore_update_advice_queue_status start ###")
-    try:
-        db = _db_client
-
-        # 更新データ
-        update_data = {
-            "status": status,
-            "processed_at": convert_utc_to_jst(datetime.now(dt_timezone.utc)),
-        }
-        logger.info(f"{update_data=}")
-
-        if result is not None:
-            update_data["result"] = result
-
-        # adviceQueueコレクションを更新
-        db.collection("adviceQueue").document(queue_id).update(update_data)
-
-        logger.info(f"✅ Advice queue {queue_id} updated to {status}")
-        return f"✅ Advice queue {queue_id} updated to {status}"
-
-    except Exception as e:
-        error_msg = f"❌ Error updating advice queue {queue_id}: {e}"
-        logger.error(error_msg)
-        return error_msg
+        logger.error(f"Error retrieving project {project_id}: {e}")
+        return f"Error retrieving project: {str(e)}"
 
 
 def firestore_create_project(
@@ -1327,7 +1083,8 @@ def firestore_create_project(
     
     # 空のオブジェクトをフィルタリング（ADKのFunction Calling制限への対応）
     if members:
-        members = [m for m in members if m and any(m.values())]
+        # 文字列のリスト（メールアドレス）または辞書のリストを許容
+        members = [m for m in members if m]
         logger.debug(f"Filtered members: {members}")
     
     try:
@@ -1336,38 +1093,57 @@ def firestore_create_project(
         # JST timezone用のタイムスタンプ
         current_time = convert_utc_to_jst(datetime.now(dt_timezone.utc))
         
-        #ADK Agent互換のシンプルなプロジェクトドキュメント構造
+        # データベースへの保存用データ構築
         project_data = {
             "projectName": project_name,
             "projectOverview": project_overview or "",
             "status": status or "open",
             "projectOwner": [user_email],
-            "rules": rules,
             "createdAt": current_time,
             "updatedAt": current_time,
             "createdBy": user_email
         }
         
-        # membersの処理: userRefをDocumentReferenceに変換
+        # rulesのキーと値を標準化
+        processed_rules = []
+        if rules:
+            for r in rules:
+                if not isinstance(r, dict): continue
+                # key 'rule' を 'content' に変換
+                content = r.get("content") or r.get("rule") or ""
+                # priority の値を標準化
+                priority = r.get("priority", "normal")
+                priority_map = {"必須": "mandatory", "高": "high", "中": "normal", "低": "low"}
+                priority = priority_map.get(priority, priority)
+                
+                processed_rules.append({
+                    "content": content,
+                    "priority": priority
+                })
+        project_data["rules"] = processed_rules
+        
+        # membersの処理: 全ての必須フィールド (isOwner, role, roleDetails, userRef) を保証
         processed_members = []
         if members:
             for member in members:
-                if not member or not any(member.values()):
-                    continue
+                if not member: continue
+                m = {}
+                email = ""
+                if isinstance(member, dict):
+                    email = member.get("userRef") or member.get("email") or ""
+                    if hasattr(email, "path"): email = email.id # DocumentReference対策
+                    m["isOwner"] = bool(member.get("isOwner", False))
+                    m["role"] = str(member.get("role", "Engineer"))
+                    m["roleDetails"] = str(member.get("roleDetails", ""))
+                elif isinstance(member, str):
+                    email = member
+                    m["isOwner"] = (email == user_email)
+                    m["role"] = "Owner" if m["isOwner"] else "Engineer"
+                    m["roleDetails"] = ""
                 
-                # Copy member dict to avoid modifying original
-                m = dict(member)
-                # userRefかemailのいずれかをメールアドレスとして取得
-                user_email_member = m.get("userRef") or m.get("email")
-                if isinstance(user_email_member, str) and "@" in user_email_member:
-                    # users/{email}へのDocumentReferenceに変換
-                    m["userRef"] = db.collection("users").document(user_email_member)
-                    # emailキーが存在する場合は削除してuserRefに統一
-                    if "email" in m:
-                        del m["email"]
-                
-                processed_members.append(m)
-        
+                if "@" in str(email):
+                    m["userRef"] = db.collection("users").document(str(email))
+                    processed_members.append(m)
         project_data["members"] = processed_members
         
         # Firestoreに保存 (空のドキュメントリファレンスを作成して自動生成されたIDを取得)
@@ -1404,27 +1180,22 @@ def firestore_create_project(
         return {"firestore_create_project_response": {"error": error_msg}}
 
 
-def firestore_get_all_projects() -> dict:
+def firestore_get_all_projects_dict() -> dict:
     """
-    Firestore直接操作で全プロジェクトを取得する (ADK Agent用レスポンス形式)
+    Firestore直接操作で全プロジェクトを取得する (辞書形式)
+    内部的なクリーニング処理が含まれます。
     """
-    logger.info("Getting all projects via Firestore")
+    logger.info("Getting all projects via Firestore (dict format)")
     
     try:
         db = _db_client
-        
-        # projectsコレクションから全ドキュメントを取得
-        projects_ref = db.collection("projects")
-        docs = projects_ref.stream()
+        docs = db.collection("projects").stream()
         
         projects = []
         for doc in docs:
             project_data = doc.to_dict()
-            # FirestoreオブジェクトをJSON化可能な形式に変換
             cleaned_data = _clean_firestore_data(project_data)
             projects.append(cleaned_data)
-        
-        logger.info(f"✅ Retrieved {len(projects)} projects")
         
         return {
             "firestore_get_all_projects_response": {
@@ -1432,17 +1203,8 @@ def firestore_get_all_projects() -> dict:
                 "count": len(projects)
             }
         }
-        
     except Exception as e:
-        error_msg = f"Failed to get projects: {str(e)}"
-        logger.error(error_msg)
-        return {
-            "firestore_get_all_projects_response": {
-                "error": error_msg,
-                "projects": [],
-                "count": 0
-            }
-        }
+        return {"firestore_get_all_projects_response": {"error": str(e), "projects": [], "count": 0}}
 
 
 def firestore_update_project(
@@ -1518,3 +1280,130 @@ def firestore_update_project(
         error_msg = f"Failed to update project: {str(e)}"
         logger.error(error_msg)
         return {"firestore_update_project_response": {"error": error_msg}}
+
+
+def firestore_create_task(
+    user_email: str,
+    project_id: str,
+    title: str,
+    description: Optional[str] = "",
+    assignee: Optional[str] = "",
+    status: str = "ready",
+    priority: str = "medium",
+    startDate: Optional[str] = None,
+    dueDate: Optional[str] = None
+) -> dict:
+    """
+    プロジェクト配下に新規タスクを作成する
+    """
+    logger.info(f"Creating task for project {project_id}: {title}")
+    
+    if not project_id or not title:
+        return {"firestore_create_task_response": {"error": "project_id and title are required"}}
+    
+    try:
+        db = _db_client
+        current_time = convert_utc_to_jst(datetime.now(dt_timezone.utc))
+        
+        # データの構築
+        task_data = {
+            "title": title,
+            "description": description or "",
+            "assignee": assignee or "",
+            "status": status,
+            "priority": priority,
+            "inReview": False,
+            "type": "task",
+            "createdAt": current_time,
+            "updatedAt": current_time,
+            "updatedUserEmail": user_email
+        }
+        
+        # 日付文字列の変換 (ISO format)
+        if startDate:
+            try:
+                task_data["startDate"] = datetime.fromisoformat(startDate.replace("Z", "+00:00"))
+            except: pass
+        if dueDate:
+            try:
+                task_data["dueDate"] = datetime.fromisoformat(dueDate.replace("Z", "+00:00"))
+            except: pass
+            
+        # 保存実行 (projects/{projectId}/tasks/{taskId})
+        doc_ref = db.collection("projects").document(project_id).collection("tasks").document()
+        doc_ref.set(task_data)
+        
+        return {
+            "firestore_create_task_response": {
+                "taskId": doc_ref.id,
+                "title": title
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating task: {e}")
+        return {"firestore_create_task_response": {"error": str(e)}}
+
+
+def firestore_create_subtask(
+    user_email: str,
+    project_id: str,
+    parent_task_id: str,
+    title: str,
+    description: Optional[str] = "",
+    assignee: Optional[str] = "",
+    status: str = "ready",
+    priority: str = "medium",
+    startDate: Optional[str] = None,
+    dueDate: Optional[str] = None
+) -> dict:
+    """
+    タスク配下に新規サブタスクを作成する
+    """
+    logger.info(f"Creating subtask for task {parent_task_id} in project {project_id}: {title}")
+    
+    if not project_id or not parent_task_id or not title:
+        return {"firestore_create_subtask_response": {"error": "project_id, parent_task_id and title are required"}}
+    
+    try:
+        db = _db_client
+        current_time = convert_utc_to_jst(datetime.now(dt_timezone.utc))
+        
+        # データの構築
+        subtask_data = {
+            "id": str(uuid.uuid4()), # サンプルに従いUUIDをIDフィールドとしてセット
+            "title": title,
+            "description": description or "",
+            "assignee": assignee or "",
+            "status": status,
+            "priority": priority,
+            "inReview": False,
+            "type": "task",
+            "createdAt": current_time,
+            "updatedAt": current_time,
+            "updatedUserEmail": user_email
+        }
+        
+        # 日付文字列の変換
+        if startDate:
+            try:
+                subtask_data["startDate"] = datetime.fromisoformat(startDate.replace("Z", "+00:00"))
+            except: pass
+        if dueDate:
+            try:
+                subtask_data["dueDate"] = datetime.fromisoformat(dueDate.replace("Z", "+00:00"))
+            except: pass
+            
+        # 保存実行 (projects/{projectId}/tasks/{parent_taskId}/subTasks/{subTaskId})
+        doc_ref = db.collection("projects").document(project_id).collection("tasks").document(parent_task_id).collection("subTasks").document()
+        doc_ref.set(subtask_data)
+        
+        return {
+            "firestore_create_subtask_response": {
+                "subTaskId": doc_ref.id,
+                "id": subtask_data["id"],
+                "title": title
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating subtask: {e}")
+        return {"firestore_create_subtask_response": {"error": str(e)}}
